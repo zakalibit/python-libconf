@@ -40,6 +40,99 @@ SKIP_RE = re.compile(r'\s+|#.*$|//.*$|/\*(.|\n)*?\*/', re.MULTILINE)
 UNPRINTABLE_CHARACTER_RE = re.compile(r'[\x00-\x1F\x7F]')
 
 
+# ${var.name} substitution with in the file or env
+RE_VAR = re.compile(r'\${(?P<mvar>[\w\._-]+)}')
+
+## dictionary value lookup, using key, or a path through the object graph
+def jpath_find(path, dictionary):
+    path_parts = path.split('.')
+    key = path_parts[-1]
+    key_path = path_parts[:-1]
+
+    ## grab a value on the topmost level if exists
+    value = ((key in dictionary) and dictionary[key]) or None
+
+    ## scan dict tree for best match
+    current_node = dictionary
+    for p in key_path:
+        if p not in current_node: break
+        ## check if key value exists at current level
+        if key in current_node[p]:
+            value = current_node[p][key]
+
+        if isinstance(current_node[p], dict):
+           current_node = current_node[p]
+        else: break
+
+    return value
+
+## lookups a key in a dictionary, key can be a valid json path
+def resolve_config_value(path, dictionary):
+    value = jpath_find(path, dictionary)
+    ## if not found in the config at any level, try env
+    if value is None and (path in os.environ):
+        value = os.environ[path]
+    if value is None:
+        raise Exception('{} can not be resolved...'.format(path))
+    return value
+
+
+def parse_substitutions(value, cfg):
+    org_value = value
+    ## find all ${var}
+    res = RE_VAR.findall(value)
+    ## handle nested substitutions
+    max_nested_subs = 7
+    while res and max_nested_subs:
+        max_nested_subs -= 1
+        for m in res:
+            resolved_value = resolve_config_value(m, cfg)
+            pattern = '${'+m+'}'
+            if value == pattern:
+                ## value is a full match
+                value = resolved_value
+            else:
+                ## value contains a macth
+                value = value.replace(pattern, str(resolved_value))
+
+        res = isinstance(value, str) and RE_VAR.findall(value)
+
+    if res:
+        raise Exception('Max nested substitution limit exceded for: {}'.format(org_value))
+    return value
+
+
+if sys.version_info[0] < 3:
+    PY_STR_ENCODING = unicode
+else:
+    PY_STR_ENCODING = bytes
+
+
+def deunicodify_hook(pairs, cfg):
+    global PY_STR_ENCODING
+
+    new_pairs = []
+    for key, value in pairs:
+        if isinstance(value, PY_STR_ENCODING):
+            value = value.encode('utf-8')
+        if isinstance(key, PY_STR_ENCODING):
+            key = key.encode('utf-8')
+
+        if isinstance(value, str):
+            value = parse_substitutions(value, cfg)
+        elif isinstance(value, list):
+            nv = []
+            for l in value:
+                if isinstance(l, PY_STR_ENCODING):
+                    l = l.encode('utf-8')
+                if isinstance(l, str):
+                    l = parse_substitutions(l, cfg)
+                nv.append(l)
+            value = nv
+
+        new_pairs.append((key, value))
+    return collections.OrderedDict(new_pairs)
+
 # load() logic
 ##############
 
@@ -264,6 +357,12 @@ class TokenStream:
         tokens.extend(tokenizer.tokenize(''.join(lines)))
         return cls(tokens)
 
+
+    def rewind(self):
+        self.position = 0
+        return self
+
+
     def peek(self):
         '''Return (but do not consume) the next token
 
@@ -330,19 +429,18 @@ class Parser:
     the config file data in a ``json``-module-style format.
     '''
 
-    def __init__(self, tokenstream):
+    def __init__(self, tokenstream, object_pairs_hook=None):
         self.tokens = tokenstream
+        self.object_pairs_hook = object_pairs_hook
 
     def parse(self):
-        return self.configuration()
-
-    def configuration(self):
         result = self.setting_list_or_empty()
         if not self.tokens.finished():
             raise ConfigParseError("Expected end of input but found %s" %
                                    (self.tokens.peek(),))
 
         return result
+
 
     def setting_list_or_empty(self):
         result = AttrDict()
@@ -351,7 +449,11 @@ class Parser:
             if s is None:
                 return result
 
-            result[s[0]] = s[1]
+            if self.object_pairs_hook is None:
+                result[s[0]] = s[1]
+            else:
+                result.update(self.object_pairs_hook([s]))
+
 
     def setting(self):
         name = self.tokens.accept('name')
@@ -487,7 +589,8 @@ def load(f, filename=None, includedir=''):
     tokenstream = TokenStream.from_file(f,
                                         filename=filename,
                                         includedir=includedir)
-    return Parser(tokenstream).parse()
+    cfg = Parser(tokenstream).parse()
+    return Parser(tokenstream.rewind(), object_pairs_hook=lambda p: deunicodify_hook(p, cfg)).parse()
 
 
 def loads(string, filename=None, includedir=''):
